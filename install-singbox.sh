@@ -1,95 +1,70 @@
 #!/bin/sh
-#
-# Sing-Box Installer for Alpine Linux
-# - VLESS + TLS (Self-Signed Cert)
-# - Hysteria2
-# - Fixed TLS Domain: kyn.com (NOT required to resolve)
-#
-# GitHub-friendly version (no color codes, no interactive input)
+# =========================================
+# 一键安装 sing-box (musl 版本)
+# 自动生成 VLESS + Hysteria2 + 自签 TLS
+# Alpine 容器专用 (256MiB / 0.25GiB)
+# =========================================
 
-set -e
-
-WORK_DIR="/etc/sing-box"
-BIN_DIR="/usr/local/bin"
-CONFIG="${WORK_DIR}/config.json"
+# 配置
 DOMAIN="kyn.com"
+CONFIG_DIR="/etc/sing-box"
+CERT_DIR="$CONFIG_DIR/cert"
+SINGBOX_BIN="/usr/local/bin/sing-box"
 VLESS_PORT=443
 H2_PORT=8443
 
-echo "[INFO] Updating apk packages..."
-apk update
-apk add --no-cache curl tar ca-certificates jq openssl bash
-
-# Detect architecture
-ARCH="$(uname -m)"
-case "$ARCH" in
-  x86_64|amd64) ARCH="amd64" ;;
-  aarch64) ARCH="arm64" ;;
-  *) ARCH="amd64" ;;
-esac
-
-# Install sing-box
-SINGBOX_BIN="${BIN_DIR}/sing-box"
-if [ ! -f "$SINGBOX_BIN" ]; then
-  echo "[INFO] Downloading sing-box from GitHub..."
-  LATEST_URL="$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/SagerNet/sing-box/releases/latest)"
-  TAG="$(basename "$LATEST_URL" | sed 's/^v//')"
-
-  TMP=$(mktemp -d)
-  cd "$TMP"
-
-  FILE="sing-box-${TAG}-linux-${ARCH}.tar.gz"
-  curl -fLO "https://github.com/SagerNet/sing-box/releases/download/v${TAG}/${FILE}"
-  tar -xzf "$FILE"
-
-  install -m 755 $(find . -name sing-box -type f) "$SINGBOX_BIN"
-  cd /
-  rm -rf "$TMP"
+# 检查 root
+if [ "$(id -u)" != "0" ]; then
+    echo "请使用 root 执行"
+    exit 1
 fi
 
-# Detect public IP
-PUB_IP="$(curl -s ifconfig.me || curl -s ipinfo.io/ip)"
-[ -z "$PUB_IP" ] && PUB_IP="0.0.0.0"
+# 创建目录
+mkdir -p "$CONFIG_DIR" "$CERT_DIR"
 
-# Credentials
-UUID=$(cat /proc/sys/kernel/random/uuid)
-H2_PASS=$(head -c 16 /dev/urandom | base64 | tr -d '=')
+# 安装依赖
+apk update
+apk add -q curl openssl socat jq
 
-# Certificate
-CERT_DIR="${WORK_DIR}/cert"
-mkdir -p "$CERT_DIR"
+# 生成自签 TLS
+echo "生成自签 TLS..."
+openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+  -keyout "$CERT_DIR/server.key" -out "$CERT_DIR/server.crt" \
+  -subj "/CN=$DOMAIN"
 
-openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-  -subj "/CN=${DOMAIN}" \
-  -keyout "${CERT_DIR}/server.key" \
-  -out "${CERT_DIR}/server.crt" >/dev/null 2>&1
+# 下载 musl 版本 sing-box
+echo "下载 sing-box (musl)..."
+SINGBOX_VER=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name)
+wget -q -O "$SINGBOX_BIN" "https://github.com/SagerNet/sing-box/releases/download/$SINGBOX_VER/sing-box-${SINGBOX_VER#v}-linux-musl-amd64"
+chmod +x "$SINGBOX_BIN"
 
-# Config directory
-mkdir -p "$WORK_DIR"
+# 生成 UUID 和 Hysteria2 密码
+VLESS_UUID=$(cat /proc/sys/kernel/random/uuid)
+H2_PASS=$(openssl rand -base64 16 | tr -d "=+/")
 
-# Write config
-cat > "$CONFIG" <<EOF
+# 生成 config.json
+cat > "$CONFIG_DIR/config.json" <<EOF
 {
   "log": { "level": "info" },
   "inbounds": [
     {
       "type": "vless",
       "listen": "0.0.0.0",
-      "listen_port": ${VLESS_PORT},
-      "users": [ { "id": "${UUID}" } ],
+      "listen_port": $VLESS_PORT,
+      "users": [ { "id": "$VLESS_UUID" } ],
       "tls": {
         "enabled": true,
-        "server_name": "${DOMAIN}",
+        "server_name": "$DOMAIN",
         "certificates": [
-          { "certificate": "${CERT_DIR}/server.crt", "private_key": "${CERT_DIR}/server.key" }
+          { "certificate": "$CERT_DIR/server.crt", "private_key": "$CERT_DIR/server.key" }
         ]
       }
     },
     {
       "type": "hysteria2",
       "listen": "0.0.0.0",
-      "listen_port": ${H2_PORT},
-      "users": [ { "password": "${H2_PASS}" } ],
+      "listen_port": $H2_PORT,
+      "users": [ { "password": "$H2_PASS" } ],
       "masquerade": "https://bing.com",
       "udp": true
     }
@@ -101,18 +76,21 @@ cat > "$CONFIG" <<EOF
 }
 EOF
 
-# Run sing-box
-nohup "$SINGBOX_BIN" run -c "$CONFIG" >/var/log/sing-box.log 2>&1 &
+# 停止旧进程并启动 sing-box
+pkill sing-box 2>/dev/null
+nohup "$SINGBOX_BIN" run -c "$CONFIG_DIR/config.json" >/var/log/sing-box.log 2>&1 &
 
-# Output URIs
+# 等待启动
+sleep 2
+
+# 输出节点 URI
+echo "========================="
+echo "VLESS 节点:"
+echo "vless://$VLESS_UUID@$DOMAIN:$VLESS_PORT?encryption=none&security=tls&sni=$DOMAIN&allowInsecure=1#VLESS-kyn"
 echo ""
-echo "===== Generated Nodes ====="
-echo ""
-echo "VLESS Node:"
-echo "vless://${UUID}@${DOMAIN}:${VLESS_PORT}?encryption=none&security=tls&sni=${DOMAIN}&allowInsecure=1#VLESS-kyn"
-echo ""
-echo "Hysteria2 Node:"
-echo "hysteria2://${H2_PASS}@${PUB_IP}:${H2_PORT}?insecure=1&obfs=bing#HY2-kyn"
-echo ""
-echo "Config: $CONFIG"
-echo ""
+echo "Hysteria2 节点:"
+echo "hysteria2://$H2_PASS@$DOMAIN:$H2_PORT?insecure=1&obfs=bing#HY2-kyn"
+echo "========================="
+echo "配置文件: $CONFIG_DIR/config.json"
+echo "日志文件: /var/log/sing-box.log"
+echo "安装完成!"
