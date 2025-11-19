@@ -3,13 +3,15 @@
 # Alpine 256MiB 容器专用
 # 一键安装 Xray-core (musl)
 # 支持：
-#   1. 有域名：自动申请 Let's Encrypt 证书
+#   1. 有域名：自动申请 Let's Encrypt 证书 + 自动写入 acme.sh 续期 crontab
 #   2. 无域名：使用自签 TLS（沿用原来的逻辑）
+#   3. 安装完后，登录终端直接输入 xray 即可查看节点信息（alias）
 # =========================================
 
 CONFIG_DIR="/etc/xray"
 CERT_DIR="$CONFIG_DIR/cert"
 XRAY_BIN="/usr/local/bin/xray"
+INFO_SH="/usr/local/bin/xray-info"
 
 # 默认端口
 DEFAULT_PORT=443
@@ -94,7 +96,7 @@ echo "===================================="
 # 创建目录
 mkdir -p "$CONFIG_DIR" "$CERT_DIR"
 
-# 安装依赖（增加 unzip）
+# 安装依赖（增加 unzip / jq）
 apk update
 apk add -q curl openssl jq tar unzip
 
@@ -133,6 +135,22 @@ if [ "$USE_DOMAIN" -eq 1 ]; then
 
     echo "Let's Encrypt 证书申请并安装成功。"
 
+    echo "===================================="
+    echo "配置 acme.sh 自动续期（写入 crontab）..."
+
+    # 清理旧的 acme.sh 续期任务（如果有）
+    crontab -l 2>/dev/null | grep -v "acme.sh --cron" > /tmp/cron_tmp || true
+
+    # 每天凌晨 3:15 执行一次续期
+    echo "15 3 * * * $HOME/.acme.sh/acme.sh --cron --home $HOME/.acme.sh > /dev/null 2>&1" >> /tmp/cron_tmp
+
+    crontab /tmp/cron_tmp
+    rm -f /tmp/cron_tmp
+
+    echo "acme.sh 自动续期任务已写入 crontab："
+    crontab -l
+    echo "提示：请确保容器内有 crond 在运行，否则定时任务不会执行。"
+
 else
     # 无域名模式：生成自签 TLS
     echo "===================================="
@@ -152,8 +170,8 @@ DOWNLOAD_URL="https://github.com/XTLS/Xray-core/releases/download/$XRAY_VER/$ASS
 echo "下载 Xray-core: $DOWNLOAD_URL"
 curl -L -o /tmp/xray.zip "$DOWNLOAD_URL"
 unzip -o /tmp/xray.zip -d /tmp/
-mv /tmp/xray /usr/local/bin/xray
-chmod +x /usr/local/bin/xray
+mv /tmp/xray "$XRAY_BIN"
+chmod +x "$XRAY_BIN"
 
 # 生成 UUID
 VLESS_UUID=$(cat /proc/sys/kernel/random/uuid)
@@ -195,20 +213,85 @@ EOF
 
 # 停止旧进程并启动 Xray
 pkill xray 2>/dev/null || true
-nohup /usr/local/bin/xray -config "$CONFIG_DIR/config.json" >/var/log/xray.log 2>&1 &
+nohup "$XRAY_BIN" -config "$CONFIG_DIR/config.json" >/var/log/xray.log 2>&1 &
 
 sleep 2
 
+# ==========================
+# 生成查询脚本 /usr/local/bin/xray-info
+# ==========================
+
+# 根据当前安装模式，决定默认 allowInsecure / 模式说明
+if [ "$USE_DOMAIN" -eq 1 ]; then
+    INFO_ALLOW=0
+    INFO_MODE="Let's Encrypt 证书"
+else
+    INFO_ALLOW=1
+    INFO_MODE="自签证书"
+fi
+
+cat > "$INFO_SH" <<EOF
+#!/bin/sh
+CONFIG="/etc/xray/config.json"
+
+if [ ! -f "\$CONFIG" ]; then
+    echo "未找到 Xray 配置文件：\$CONFIG"
+    exit 1
+fi
+
+UUID=\$(jq -r '.inbounds[0].settings.clients[0].id' "\$CONFIG")
+PORT=\$(jq -r '.inbounds[0].port' "\$CONFIG")
+SNI=\$(jq -r '.inbounds[0].streamSettings.tlsSettings.serverName' "\$CONFIG")
+IP=\$(curl -s ipv4.ip.sb || curl -s ifconfig.me || curl -s ipinfo.io/ip)
+
+ALLOW=$INFO_ALLOW
+MODE="$INFO_MODE"
+
+echo "================ Xray 节点信息 ================"
+echo "模式：\$MODE"
+echo "UUID：\$UUID"
+echo "端口：\$PORT"
+echo "SNI：\$SNI"
+echo "IP：\$IP"
+echo
+echo "VLESS 链接："
+echo "vless://\$UUID@\${IP:-$CONNECT_ADDR}:\$PORT?encryption=none&security=tls&sni=\$SNI&allowInsecure=\$ALLOW#Xray"
+echo
+echo "配置文件：/etc/xray/config.json"
+echo "日志路径：/var/log/xray.log"
+echo "==============================================="
+EOF
+
+chmod +x "$INFO_SH"
+
+# ==========================
+# 给 root 加一个 alias：xray -> xray-info
+# 不影响脚本中调用的 /usr/local/bin/xray 二进制逻辑
+# 只在你登录 shell 时生效
+# ==========================
+
+for f in /root/.profile /root/.bashrc /root/.ashrc; do
+    [ -f "$f" ] || touch "$f"
+    # 避免重复写入
+    if ! grep -q "alias xray=" "$f"; then
+        echo "alias xray='$INFO_SH'" >> "$f"
+    fi
+done
+
 echo "========================="
 if [ "$USE_DOMAIN" -eq 1 ]; then
-    echo "当前为【有域名 + Let's Encrypt】模式"
+    echo "当前为〖有域名 + Let's Encrypt〗模式"
     echo "建议客户端直接使用域名连接（host = 域名）："
     echo "vless://$VLESS_UUID@$DOMAIN:$VLESS_PORT?encryption=none&security=tls&sni=$DOMAIN&allowInsecure=0#VLESS-xray-$DOMAIN"
 else
-    echo "当前为【无域名 + 自签证书】模式"
+    echo "当前为〖无域名 + 自签证书〗模式"
     echo "VLESS 节点 (公网 IP + 伪域名 SNI)："
     echo "vless://$VLESS_UUID@$CONNECT_ADDR:$VLESS_PORT?encryption=none&security=tls&sni=$DOMAIN&allowInsecure=1#VLESS-xray-selfsigned"
 fi
+echo
+echo "以后登录终端，可以直接输入： xray  来查看当前节点信息。"
+echo "如需直接调用 Xray 二进制，可使用： $XRAY_BIN"
+echo
 echo "配置路径： $CONFIG_DIR/config.json"
 echo "日志路径： /var/log/xray.log"
 echo "========================="
